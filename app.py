@@ -108,6 +108,20 @@ OECD_PAGE_URL = (
 OECD_API_URL = "https://sdmx.oecd.org/public/rest/data/OECD.CTP.TPS,DSD_TAX_CIT@DF_CIT,/all"
 TE_BONDS_URL = "https://tradingeconomics.com/bonds"
 TE_COUNTRY_URL = "https://tradingeconomics.com/{slug}/government-bond-yield"
+TE_LIST_URL = "https://tradingeconomics.com/country-list/government-bond-10y"
+FRED_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={series}"
+# FRED series used only as a backup when Trading Economics blocks the server:
+# US = daily 10Y Treasury (DGS10); others = OECD long-term (10Y) government yield, monthly.
+FRED_ISO2 = {
+    "mexico": "MX", "canada": "CA", "united kingdom": "GB", "germany": "DE", "france": "FR",
+    "italy": "IT", "spain": "ES", "japan": "JP", "south korea": "KR", "australia": "AU",
+    "new zealand": "NZ", "switzerland": "CH", "sweden": "SE", "norway": "NO", "denmark": "DK",
+    "poland": "PL", "czech republic": "CZ", "hungary": "HU", "south africa": "ZA", "chile": "CL",
+    "colombia": "CO", "israel": "IL", "ireland": "IE", "portugal": "PT", "greece": "GR",
+    "netherlands": "NL", "belgium": "BE", "austria": "AT", "finland": "FI", "slovakia": "SK",
+    "slovenia": "SI", "luxembourg": "LU", "latvia": "LV", "lithuania": "LT", "iceland": "IS",
+    "india": "IN", "costa rica": "CR",
+}
 
 BROWSER_HEADERS = {
     "User-Agent": (
@@ -235,6 +249,9 @@ def currency_of(key: str) -> str:
     if key in EURO:
         return "EUR"
     return CURRENCY.get(key, "LCY")
+
+
+FALLBACK_YIELDS_KEYS = {canon(k): v / 100 for k, v in FALLBACK_YIELDS.items()}
 
 
 def now_utc() -> str:
@@ -377,7 +394,7 @@ def fetch_tax_rates() -> dict:
         df["year"] = pd.to_numeric(df["TIME_PERIOD"].astype(str).str[:4], errors="coerce")
         df = df.dropna(subset=["value", "year"])
         skip = {area_c, label_c, "OBS_VALUE", "TIME_PERIOD", "value", "year"}
-        desc_cols = [c for c in cols if c not in skip and df[c].dtype == object]
+        desc_cols = [c for c in cols if c not in skip and not pd.api.types.is_numeric_dtype(df[c])]
         df["desc"] = df[desc_cols].astype(str).agg(" | ".join, axis=1).str.lower()
         bad = r"targeted|small|reduced|sub-central|subcentral|central government|exclusive|surtax|special"
         comb = df[df["desc"].str.contains("combined") & ~df["desc"].str.contains("targeted|small|reduced")]
@@ -425,7 +442,9 @@ def _parse_te_bonds(html: str) -> dict:
                 break
         if y is None:
             continue
-        date_txt = tds[-1].get_text(strip=True) if tds else ""
+        texts = [td.get_text(strip=True) for td in tds]
+        date_txt = next((t for t in reversed(texts)
+                         if re.search(r"[A-Za-z]{3}/\d{1,2}|\d{1,2}:\d{2}|\d{4}-\d{2}", t)), texts[-1] if texts else "")
         key = canon(m.group(1).replace("-", " "))
         if key in NOT_COUNTRIES:
             continue
@@ -435,20 +454,66 @@ def _parse_te_bonds(html: str) -> dict:
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def fetch_yields() -> dict:
-    """10-year government bond yields from Trading Economics (scraped, no API key)."""
+    """10-year government bond yields from Trading Economics (scraped, no API key).
+    Tries the /bonds page first, then TE's 10Y country list page."""
+    errors = []
+    for url in (TE_BONDS_URL, TE_LIST_URL):
+        try:
+            r = requests.get(url, headers=BROWSER_HEADERS, timeout=30)
+            r.raise_for_status()
+            data = _parse_te_bonds(r.text)
+            if len(data) < 10:
+                raise ValueError(f"bond table not found (only {len(data)} rows parsed)")
+            for v in data.values():
+                v["source"] = "Trading Economics"
+            return {"data": data, "status": "Live", "as_of": f"Scraped {now_utc()} from {url}",
+                    "fetched": now_utc(), "error": None}
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{url}: {e}")
+    data = {canon(k): {"yield": v / 100, "date": "offline", "slug": canon(k).replace(" ", "-"),
+                       "source": "Offline snapshot"} for k, v in FALLBACK_YIELDS.items()}
+    return {"data": data, "status": "Fallback", "as_of": FALLBACK_YIELDS_DATE,
+            "fetched": now_utc(), "error": " | ".join(errors)}
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def fetch_fred_yield(key: str) -> dict | None:
+    """Backup 10Y yield from FRED (St. Louis Fed). No API key needed."""
+    series = "DGS10" if key == "united states" else (
+        f"IRLTLT01{FRED_ISO2[key]}M156N" if key in FRED_ISO2 else None)
+    if series is None:
+        return None
     try:
-        r = requests.get(TE_BONDS_URL, headers=BROWSER_HEADERS, timeout=30)
+        r = requests.get(FRED_CSV_URL.format(series=series), headers=BROWSER_HEADERS, timeout=25)
         r.raise_for_status()
-        data = _parse_te_bonds(r.text)
-        if len(data) < 10:
-            raise ValueError("Bond table not found in Trading Economics page")
-        return {"data": data, "status": "Live", "as_of": f"Scraped {now_utc()}",
-                "fetched": now_utc(), "error": None}
-    except Exception as e:  # noqa: BLE001
-        data = {canon(k): {"yield": v / 100, "date": "offline", "slug": canon(k).replace(" ", "-")}
-                for k, v in FALLBACK_YIELDS.items()}
-        return {"data": data, "status": "Fallback", "as_of": FALLBACK_YIELDS_DATE,
-                "fetched": now_utc(), "error": str(e)}
+        df = pd.read_csv(io.StringIO(r.text))
+        df = pd.DataFrame({"date": df.iloc[:, 0].astype(str),
+                           "value": pd.to_numeric(df.iloc[:, 1], errors="coerce")}).dropna()
+        if df.empty:
+            return None
+        last = df.iloc[-1]
+        freq = "daily" if series == "DGS10" else "monthly avg."
+        return {"yield": float(last.iloc[1]) / 100, "date": f"{last.iloc[0]} ({freq})",
+                "slug": key.replace(" ", "-"), "source": f"FRED {series}"}
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def get_yield(key: str, live_table: dict, table_live: bool) -> tuple[dict | None, str]:
+    """Return (yield info, status) trying TE table, TE country page, FRED, then snapshot."""
+    if table_live and key in live_table:
+        return live_table[key], "Live"
+    info = fetch_te_country(key.replace(" ", "-"))
+    if info:
+        info["source"] = "Trading Economics (country page)"
+        return info, "Live"
+    info = fetch_fred_yield(key)
+    if info:
+        return info, "Live (FRED backup)"
+    if key in FALLBACK_YIELDS_KEYS:
+        return live_table.get(key) or {"yield": FALLBACK_YIELDS_KEYS[key], "date": "offline",
+                                       "source": "Offline snapshot"}, "Fallback"
+    return None, "Missing"
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
@@ -464,7 +529,8 @@ def fetch_te_country(slug: str) -> dict | None:
         if not m:
             return None
         d = re.search(r"on ([A-Z][a-z]+ \d{1,2}, \d{4})", text)
-        return {"yield": float(m.group(1)) / 100, "date": d.group(1) if d else now_utc(), "slug": slug}
+        return {"yield": float(m.group(1)) / 100, "date": d.group(1) if d else now_utc(), "slug": slug,
+                "source": "Trading Economics (country page)"}
     except Exception:  # noqa: BLE001
         return None
 
@@ -526,7 +592,8 @@ def pct(x, d=2) -> str:
 
 
 def badge(status: str) -> str:
-    cls = {"Live": "b-live", "Fallback": "b-fallback", "Manual": "b-manual", "Calculated": "b-calc"}.get(status, "b-calc")
+    cls = {"Live": "b-live", "Live (FRED backup)": "b-live", "Fallback": "b-fallback", "Missing": "b-fallback",
+           "Manual": "b-manual", "Calculated": "b-calc"}.get(status, "b-calc")
     return f'<span class="badge {cls}">{status}</span>'
 
 
@@ -544,7 +611,11 @@ tax_rates = taxes["rates"]
 yield_data = dict(ylds["data"])
 
 # Country universe = countries with a 10Y yield (live or fallback), plus the US
-country_keys = sorted(set(yield_data) | {"united states"}, key=lambda k: display_name(k))
+table_live = ylds["status"] == "Live"
+universe = set(yield_data) | {"united states"}
+if not table_live:
+    universe |= set(FRED_ISO2)
+country_keys = sorted(universe, key=lambda k: display_name(k))
 country_labels = {k: display_name(k) for k in country_keys}
 
 # --------------------------------------------------------------------------------------
@@ -599,12 +670,11 @@ with st.sidebar:
     tax_us_fetched = tax_rates.get("united states")
     tax_fx_fetched = tax_rates.get(ckey)
 
-    rf_us_info = yield_data.get("united states")
-    if ylds["status"] == "Live" and rf_us_info is None:
-        rf_us_info = fetch_te_country("united-states")
-    rf_fx_info = yield_data.get(ckey)
-    if ylds["status"] == "Live" and rf_fx_info is None and ckey != "united states":
-        rf_fx_info = fetch_te_country(ckey.replace(" ", "-"))
+    rf_us_info, st_rf_us = get_yield("united states", yield_data, table_live)
+    if ckey == "united states":
+        rf_fx_info, st_rf_fx = rf_us_info, st_rf_us
+    else:
+        rf_fx_info, st_rf_fx = get_yield(ckey, yield_data, table_live)
 
     o_beta = st.toggle("Unlevered beta", key="t_beta")
     beta_u = st.number_input("Unlevered beta", 0.0, 5.0, round(beta_fetched, 4), 0.01, format="%.4f",
@@ -657,7 +727,8 @@ res = compute(beta_u, tax, debt_share, erp, rf_us, rf_fx, spread_us, spread_fx_o
 s_beta = "Manual" if o_beta else betas["status"]
 s_tax = "Manual" if o_tax else taxes["status"]
 s_spread = "Manual" if o_spread else bbb["status"]
-s_rf = "Manual" if o_rf else ylds["status"]
+s_rf_us = "Manual" if o_rf else st_rf_us
+s_rf_fx = "Manual" if o_rf else st_rf_fx
 s_fx_spread = "Manual" if o_fx_spread else "Calculated"
 
 # --------------------------------------------------------------------------------------
@@ -679,7 +750,10 @@ if tax_fx_fetched is None and not o_tax and ckey != "united states":
     warnings.append(f"OECD has no tax rate for {cname}; the U.S. rate is used. Override it in the sidebar if needed.")
 if rf_fx_info is None and ckey != "united states" and not o_rf:
     warnings.append(f"No 10Y yield found for {cname}; the U.S. yield is used. Override it in the sidebar.")
-for src, d in [("Betas", betas), ("BBB spread", bbb), ("Tax rates", taxes), ("Bond yields", ylds)]:
+if not o_rf and "Fallback" in (s_rf_us, s_rf_fx):
+    warnings.append("Bond yields: live sources unreachable, using an offline approximation. "
+                    "Click **Refresh data** or switch on the 10-year yield override.")
+for src, d in [("Betas", betas), ("BBB spread", bbb), ("Tax rates", taxes)]:
     if d["status"] == "Fallback":
         warnings.append(f"{src}: live source unreachable, using an offline snapshot ({d['as_of']}). "
                         "Click **Refresh data** or override manually.")
@@ -695,8 +769,8 @@ st.markdown(
       <span class="chip">ERP <b>{pct(erp)}</b></span>
       <span class="chip">Debt share <b>{pct(debt_share, 0)}</b></span>
       <span class="chip">USD BBB spread <b>{pct(spread_us)}</b>{badge(s_spread)}</span>
-      <span class="chip">U.S. 10Y <b>{pct(rf_us, 3)}</b>{badge(s_rf)}</span>
-      <span class="chip">{cname} 10Y <b>{pct(rf_fx, 3)}</b>{badge(s_rf)}</span>
+      <span class="chip">U.S. 10Y <b>{pct(rf_us, 3)}</b>{badge(s_rf_us)}</span>
+      <span class="chip">{cname} 10Y <b>{pct(rf_fx, 3)}</b>{badge(s_rf_fx)}</span>
     </div>
     """,
     unsafe_allow_html=True,
@@ -761,7 +835,7 @@ with tab_res:
                     axis=alt.Axis(labelAngle=0)),
             xOffset="Currency:N",
             y=alt.Y("Rate:Q", axis=alt.Axis(format="%"), title=None),
-            color=alt.Color("Currency:N", scale=alt.Scale(range=[USD_COLOR, FX_COLOR]),
+            color=alt.Color("Currency:N", scale=alt.Scale(domain=["USD", f"{fx_lbl} "], range=[USD_COLOR, FX_COLOR]),
                             legend=alt.Legend(orient="top", title=None)),
             tooltip=["Metric", "Currency", alt.Tooltip("Rate:Q", format=".2%")],
         ).properties(height=290)
@@ -822,7 +896,9 @@ with tab_all:
         y=alt.Y("Industry:N", sort=chart_rows["Industry"].tolist(), title=None),
         x=alt.X("Value:Q", title=None, axis=alt.Axis(format=fmt.replace(".2", ""))),
         yOffset="Series:N",
-        color=alt.Color("Series:N", scale=alt.Scale(range=[USD_COLOR, FX_COLOR]),
+        color=alt.Color("Series:N", scale=alt.Scale(
+            domain=[f"{metric} (USD)", f"{metric} ({fx_lbl})"] if metric != "Unlevered beta" else ["Unlevered beta"],
+            range=[USD_COLOR, FX_COLOR] if metric != "Unlevered beta" else [USD_COLOR]),
                         legend=alt.Legend(orient="top", title=None)),
         opacity=alt.condition("datum.Selected", alt.value(1.0), alt.value(0.72)),
         tooltip=["Industry", "Series", alt.Tooltip("Value:Q", format=fmt)],
@@ -877,7 +953,7 @@ with tab_assume:
 # --------------------------------------------------------------------------------------
 with tab_src:
     st.markdown("##### Where the numbers come from")
-    rf_fx_date = (rf_fx_info or {}).get("date", "n/a") if ckey != "united states" else (rf_us_info or {}).get("date", "n/a")
+    rf_fx_date = (rf_fx_info or {}).get("date", "n/a")
     src = pd.DataFrame([
         {"Input": "Unlevered industry betas (US)", "Provider": "Aswath Damodaran, NYU Stern",
          "Status": betas["status"], "Data as of": betas["as_of"], "Link": BETAS_URL},
@@ -885,12 +961,14 @@ with tab_src:
          "Status": bbb["status"], "Data as of": bbb["as_of"], "Link": RATINGS_URL},
         {"Input": "Corporate income tax rates (combined statutory)", "Provider": "OECD Corporate Tax Statistics",
          "Status": taxes["status"], "Data as of": taxes["as_of"], "Link": OECD_PAGE_URL},
-        {"Input": "U.S. 10Y government bond yield", "Provider": "Trading Economics",
-         "Status": ylds["status"], "Data as of": f"{(rf_us_info or {}).get('date', 'n/a')} · {ylds['as_of']}",
-         "Link": TE_BONDS_URL},
-        {"Input": f"{cname} 10Y government bond yield", "Provider": "Trading Economics",
-         "Status": ylds["status"] if rf_fx_info or ckey == "united states" else "Missing",
-         "Data as of": f"{rf_fx_date} · {ylds['as_of']}", "Link": TE_BONDS_URL},
+        {"Input": "U.S. 10Y government bond yield", "Provider": (rf_us_info or {}).get("source", "n/a"),
+         "Status": st_rf_us, "Data as of": (rf_us_info or {}).get("date", "n/a"),
+         "Link": TE_BONDS_URL if "Trading" in (rf_us_info or {}).get("source", "") else
+         ("https://fred.stlouisfed.org/series/DGS10" if "FRED" in (rf_us_info or {}).get("source", "") else TE_BONDS_URL)},
+        {"Input": f"{cname} 10Y government bond yield", "Provider": (rf_fx_info or {}).get("source", "n/a"),
+         "Status": st_rf_fx, "Data as of": rf_fx_date,
+         "Link": TE_BONDS_URL if "FRED" not in (rf_fx_info or {}).get("source", "") else
+         "https://fred.stlouisfed.org/series/" + (rf_fx_info or {}).get("source", "").replace("FRED ", "")},
     ])
     st.dataframe(src, hide_index=True, width="stretch",
                  column_config={"Link": st.column_config.LinkColumn("Link", display_text="Open source")})
@@ -973,7 +1051,7 @@ inputs_df = pd.DataFrame([
     ("U.S. tax rate", tax_us, s_tax), (f"{cname} tax rate", tax_fx, s_tax),
     ("Equity risk premium", erp, "User"), ("Debt share D/(D+E)", debt_share, "User"),
     ("USD BBB spread", spread_us, s_spread), (f"{ccy} BBB spread", res["spread_fx"], s_fx_spread),
-    ("U.S. 10Y yield", rf_us, s_rf), (f"{cname} 10Y yield", rf_fx, s_rf),
+    ("U.S. 10Y yield", rf_us, s_rf_us), (f"{cname} 10Y yield", rf_fx, s_rf_fx),
     ("Conversion method", method_lbl, ""), ("Generated", now_utc(), ""),
 ], columns=["Input", "Value", "Source / status"])
 
